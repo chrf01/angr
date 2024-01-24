@@ -1805,10 +1805,194 @@ class SimCCARMLinuxSyscall(SimCCSyscall):
 
 class SimCCAArch64(SimCC):
     ARG_REGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-    FP_ARG_REGS = []  # TODO: ???
+    FP_ARG_REGS = ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]
+    CALLER_SAVED_REGS = [
+        "x0",
+        "x1",
+        "x2",
+        "x3",
+        "x4",
+        "x5",
+        "x6",
+        "x7",
+        "v8",
+        "v9",
+        "v10",
+        "v11",
+        "v12",
+        "v13",
+        "v14",
+        "v15"
+    ]
+
     RETURN_ADDR = SimRegArg("lr", 8)
     RETURN_VAL = SimRegArg("x0", 8)
+    OVERFLOW_RETURN_VAL = SimRegArg("x1", 8)
+    FP_RETURN_VAL = SimRegArg("v0", 128)
+    OVERFLOW_RETURN_VAL = SimRegArg("v1", 128)
     ARCH = archinfo.ArchAArch64
+    STACK_ALIGNMENT = 16
+
+    @classmethod
+    def _match(cls, arch, args, sp_delta):
+        if cls.ARCH is not None and not isinstance(arch, cls.ARCH):
+            return False
+
+        sample_inst = cls(arch)
+        all_fp_args = list(sample_inst.fp_args)
+        all_int_args = list(sample_inst.int_args)
+        both_iter = sample_inst.memory_args
+        some_both_args = [next(both_iter) for _ in range(len(args))]
+
+        for arg in args:
+            ex_arg = arg
+
+            if type(ex_arg) is SimRegArg:
+                regfile_offset = arch.registers[ex_arg.reg_name][0]
+                while regfile_offset not in arch.register_names:
+                    regfile -= 1
+                ex_arg.reg_name = arch.register_names[regfile_offset]
+                ex_arg.reg_offset = 0
+
+            if ex_arg not in all_fp_args and ex_arg not in all_int_args and ex_arg not in some_both_args:
+                if isinstance(arg, SimStackArg) and arg.stack_offset == 0:
+                    continue
+                return False
+        return True
+    
+    def next_arg(self, session, arg_type):
+        if isinstance(arg_type, (SimTypeArray, SimTypeFixedSizeArray)):
+            arg_type = SimTypePointer(arg_type.elem_type).with_arch(self.arch)
+        state = session.getstate()
+        classification = self._classify(arg_type)
+        try:
+            mapped_classes = []
+            for cls in classification:
+                if cls == "SSEUP":
+                    mapped_classes.append(mapped_classes[-1].sse_extend(self.arch_bytes))
+                elif cls == "NO_CLASS":
+                    raise NotImplementedError("BUG;BUG;BUG")
+                elif cls == "MEMORY":
+                    mapped_classes.append(next(session.bot_iter))
+                elif cls == "INTEGER":
+                    mapped_classes.append(next(session.int_iter))
+                elif cls == "SSE":
+                    mapped_classes.append(next(session.fp_iter))
+                else:
+                    raise NotImplementedError("BUG;BUG;BUG")
+        except StopIteration:
+            session.setstate(state)
+            mapped_classes = [next(session.got_iter) for _ in classification]
+
+        return refine_locs_with_struct_type(self.arch, mapped_classes, arg_type)
+    def return_val(self, ty: Optional[SimType], perspective_returned=False):
+        if ty is None:
+            return None
+        if ty._arch is None:
+            ty = ty.with_arch(self.arch)
+        classification = self._classify(ty)
+        if any(cls == "MEMORY" for cls in classification):
+            assert all(cls == "MEMORY" for cls in classification)
+            byte_size = ty.size // self.arch.byte_width
+
+            referenced_locs = [SimStackArg(offset, self.arch.bytes) for offset in range(0, byte_size, self.arch.bytes)]
+            referenced_loc = refine_locs_with_struct_type(self.arch, referenced_locs, ty)
+            
+            reference_loc = SimReferenceArgument(self.RETURN_VAL, referenced_loc)
+            return reference_loc
+        else:
+            mapped_classes = []
+            int_iter = iter([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
+            fp_iter = iter([self.FP_RETURN_VAL, self.OVERFLOW_FP_RETURN_VAL])
+
+            for cls in classification:
+                if cls == "SSEUP":
+                    mapped_classes.append(mapped_classes[-1].sse_extend(self.arch.bytes))
+                elif cls == "NO_CLASS":
+                    raise NotImplementedError("BUG")
+                elif cls == "INTEGER":
+                    mapped_classes.append(next(int_iter))
+                elif cls == "SSE":
+                    mapped_classes.append(next(fp_iter))
+                else:
+                    raise NotImplementedError("BUG")
+                
+            return refine_locs_with_struct_type(self.arch, mapped_classes, ty)
+            
+
+
+    def _classify(self, ty, cunksize=None):
+        if chunksize is None:
+            chunksize = self.arch.bytes
+        
+        if isinstance(ty, SimTypeBottom):
+            nchunks = 1
+        else:
+            nchunks = (ty.size // self.arch.byte_width + chunksize - 1) // chunksize
+
+        if isinstance(ty, (SimTypeInt, SimTypeChar, SimTypePointer, SimTypeNum, SimTypeBottom, SimTypeReference)):
+            return ["INTEGER"] * nchunks
+        elif isinstance(ty, (SimTypeFloat,)):
+            return ["SSE"] + ["SSEUP"] * (nchunks - 1)
+        elif isinstance(ty, (SimStruct, SimTypeFixedSizeArray, SimUnion)):
+            if ty.size > 512:
+                return ["MEMORY"] * nchunks
+            flattened = self._flatten(ty)
+            if flattened is None:
+                return ["MEMORY"] * nchunks
+            result = ["NO_CLASS"] * nchunks
+            for offset, subty_list in flattened.items():
+                for subty in subty_list:
+                    subresult = self._classify(subty, chunksize=1)
+                    idx_start = offset // chunksize
+                    idx_end = (offset + (subty.size // self.arch.byte_width) -1) // chunksize
+                    for i, idx in enumerate(range(idx_start, idx_end + 1)):
+                        subclass = subresult[i * chunksize]
+                        result[idx] = self._combine_classes(result[idx], subclass)
+            if any(subresult == "MEMORY" for subresult in result):
+                return ["MEMORY"] * nchunks
+            if nchunks > 2 and (result[0] != "SSE" or any (subresult != "SSEUP" for subresult in result[1:])):
+                return ["MEMORY"] * nchunks
+            for i in range(1, nchunks):
+                if result[i] == "SSEUP" and result[i - 1] not in ("SSE", "SSEUP"):
+                    result[i] = "SSE"
+            return result
+        else:
+            raise NotImplementedError("weird shit")
+                                
+    def _flatten(self, ty) -> Optional[Dict[int, List[SimType]]]:
+        result: Dict[int, List[SimType]] = defaultdict(list)
+        if isinstance(ty, SimStruct):
+            if ty.packed:
+                return None
+            for field, subty in ty.field.items():
+                offset = ty.offsets[field]
+                subresult = self._flatten(subty)
+                if subresult is None:
+                    return None
+                for suboffset, subsubty_list in subresult.items():
+                    result[offset + suboffset] += subsubty_list
+        elif isinstance(ty, SimTypeFixedSizeArray):
+            subresult = self._flatten(ty.elem_type)
+            if subresult is None:
+                return None
+            for suboffset, subsubty_list in subresult.items():
+                for idx in range(ty.length):
+                    result[idx * ty.elem_type.size // self.arch.byte_width + suboffset] += subsubty_list
+
+        elif isinstance(ty, SimUnion):
+            for field, subty in ty.members.items():
+                subresult = self._flatten(subty)
+                if subresult is None:
+                    return None
+                for suboffset, subsubty_list in subresult.items():
+                    result[suboffset] += subsubty_list
+        else:
+            result[0].append(ty)
+
+        return result
+
+
 
 
 class SimCCAArch64LinuxSyscall(SimCCSyscall):
