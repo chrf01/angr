@@ -1829,7 +1829,7 @@ class SimCCAArch64(SimCC):
     RETURN_VAL = SimRegArg("x0", 8)
     OVERFLOW_RETURN_VAL = SimRegArg("x1", 8)
     FP_RETURN_VAL = SimRegArg("v0", 128)
-    OVERFLOW_RETURN_VAL = SimRegArg("v1", 128)
+    OVERFLOW_FP_RETURN_VAL = SimRegArg("v1", 128)
     ARCH = archinfo.ArchAArch64
     STACK_ALIGNMENT = 16
 
@@ -1871,20 +1871,21 @@ class SimCCAArch64(SimCC):
                 if cls == "SSEUP":
                     mapped_classes.append(mapped_classes[-1].sse_extend(self.arch_bytes))
                 elif cls == "NO_CLASS":
-                    raise NotImplementedError("BUG;BUG;BUG")
+                    raise NotImplementedError("BUG")
                 elif cls == "MEMORY":
-                    mapped_classes.append(next(session.bot_iter))
+                    mapped_classes.append(next(session.both_iter))
                 elif cls == "INTEGER":
                     mapped_classes.append(next(session.int_iter))
                 elif cls == "SSE":
                     mapped_classes.append(next(session.fp_iter))
                 else:
-                    raise NotImplementedError("BUG;BUG;BUG")
+                    raise NotImplementedError("BUG")
         except StopIteration:
             session.setstate(state)
             mapped_classes = [next(session.got_iter) for _ in classification]
 
         return refine_locs_with_struct_type(self.arch, mapped_classes, arg_type)
+    
     def return_val(self, ty: Optional[SimType], perspective_returned=False):
         if ty is None:
             return None
@@ -1917,14 +1918,13 @@ class SimCCAArch64(SimCC):
                 else:
                     raise NotImplementedError("BUG")
                 
-            return refine_locs_with_struct_type(self.arch, mapped_classes, ty)
+        return refine_locs_with_struct_type(self.arch, mapped_classes, ty)
             
 
 
-    def _classify(self, ty, cunksize=None):
+    def _classify(self, ty, chunksize=None):
         if chunksize is None:
             chunksize = self.arch.bytes
-        
         if isinstance(ty, SimTypeBottom):
             nchunks = 1
         else:
@@ -1965,7 +1965,7 @@ class SimCCAArch64(SimCC):
         if isinstance(ty, SimStruct):
             if ty.packed:
                 return None
-            for field, subty in ty.field.items():
+            for field, subty in ty.fields.items():
                 offset = ty.offsets[field]
                 subresult = self._flatten(subty)
                 if subresult is None:
