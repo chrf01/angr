@@ -1868,15 +1868,14 @@ class SimCCAArch64(SimCC):
             byte_size = ty.size // self.arch.byte_width
             referenced_locs = [SimStackArg(offset, self.arch.bytes) for offset in range(0, byte_size, self.arch.bytes)]
             referenced_loc = refine_locs_with_struct_type(self.arch, referenced_locs, ty)
-            reference_loc = SimReferenceArgument(self.RETURN_VAL, referenced_loc)
+            #reference_loc = SimReferenceArgument(self.RETURN_VAL, referenced_loc)
 
-            return reference_loc
+            return referenced_loc
         else:
             mapped_classes = []
             int_iter = iter([self.RETURN_VAL, self.OVERFLOW_RETURN_VAL])
             fp_iter = iter([self.FP_RETURN_VAL, self.OVERFLOW_FP_RETURN_VAL])
             
-            print(classification)
             for cls in classification:
                 if cls == "FLOAT":
                     mapped_classes.append(next(fp_iter))
